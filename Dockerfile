@@ -8,7 +8,12 @@ WORKDIR /app
 COPY package*.json ./
 
 # Install dependencies
-RUN npm ci --only=production && npm cache clean --force
+# Use npm install if package-lock.json doesn't exist, otherwise use npm ci
+RUN if [ -f package-lock.json ]; then \
+        npm ci --omit=dev && npm cache clean --force; \
+    else \
+        npm install --only=production && npm cache clean --force; \
+    fi
 
 # Create a non-root user to run the application
 RUN addgroup -g 1001 -S nodejs && \
