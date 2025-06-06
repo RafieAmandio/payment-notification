@@ -7,10 +7,43 @@ require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Enhanced logging function
+function logInfo(message, data = null) {
+    const timestamp = new Date().toISOString();
+    console.log(`[${timestamp}] INFO: ${message}`);
+    if (data) {
+        console.log(`[${timestamp}] DATA:`, JSON.stringify(data, null, 2));
+    }
+}
+
+function logError(message, error = null) {
+    const timestamp = new Date().toISOString();
+    console.error(`[${timestamp}] ERROR: ${message}`);
+    if (error) {
+        console.error(`[${timestamp}] ERROR DETAILS:`, error);
+    }
+}
+
+function logWarning(message, data = null) {
+    const timestamp = new Date().toISOString();
+    console.warn(`[${timestamp}] WARNING: ${message}`);
+    if (data) {
+        console.warn(`[${timestamp}] WARNING DATA:`, JSON.stringify(data, null, 2));
+    }
+}
+
 // Middleware
 app.use(cors());
 app.use(express.json());
 app.use(express.raw({ type: 'application/json' }));
+
+// Request logging middleware
+app.use((req, res, next) => {
+    const timestamp = new Date().toISOString();
+    console.log(`[${timestamp}] ${req.method} ${req.path} - IP: ${req.ip}`);
+    console.log(`[${timestamp}] Headers:`, JSON.stringify(req.headers, null, 2));
+    next();
+});
 
 // Initialize Supabase client
 const supabaseUrl = process.env.SUPABASE_URL;
@@ -20,17 +53,48 @@ const supabase = createClient(supabaseUrl, supabaseServiceKey);
 // Midtrans configuration
 const MIDTRANS_SERVER_KEY = process.env.MIDTRANS_SERVER_KEY;
 
+// Log configuration on startup
+console.log('='.repeat(50));
+console.log('Payment Notification Handler Starting...');
+console.log('='.repeat(50));
+console.log('Configuration:');
+console.log(`- Port: ${PORT}`);
+console.log(`- Supabase URL: ${supabaseUrl ? 'Set' : 'NOT SET'}`);
+console.log(`- Supabase Service Key: ${supabaseServiceKey ? 'Set' : 'NOT SET'}`);
+console.log(`- Midtrans Server Key: ${MIDTRANS_SERVER_KEY ? 'Set' : 'NOT SET'}`);
+console.log('='.repeat(50));
+
 // Function to verify Midtrans signature
 function verifySignature(orderId, statusCode, grossAmount, signature) {
-    const input = orderId + statusCode + grossAmount + MIDTRANS_SERVER_KEY;
-    const hash = crypto.createHash('sha512').update(input).digest('hex');
-    return hash === signature;
+    try {
+        const input = orderId + statusCode + grossAmount + MIDTRANS_SERVER_KEY;
+        const hash = crypto.createHash('sha512').update(input).digest('hex');
+        
+        logInfo('Signature verification', {
+            orderId,
+            statusCode,
+            grossAmount,
+            inputString: input,
+            calculatedHash: hash,
+            receivedSignature: signature,
+            match: hash === signature
+        });
+        
+        return hash === signature;
+    } catch (error) {
+        logError('Error in signature verification', error);
+        return false;
+    }
 }
 
 // Midtrans notification endpoint
 app.post('/payment-notification', async (req, res) => {
+    const startTime = Date.now();
+    logInfo('=== PAYMENT NOTIFICATION RECEIVED ===');
+    
     try {
-        console.log('Received notification:', JSON.stringify(req.body, null, 2));
+        logInfo('Raw request body received', req.body);
+        logInfo('Request headers', req.headers);
         
         const {
             transaction_status,
@@ -43,13 +107,44 @@ app.post('/payment-notification', async (req, res) => {
             payment_type
         } = req.body;
 
+        logInfo('Extracted notification data', {
+            transaction_status,
+            transaction_id,
+            order_id,
+            gross_amount,
+            signature_key: signature_key ? 'Present' : 'Missing',
+            fraud_status,
+            status_code,
+            payment_type
+        });
+
+        // Check for required fields
+        if (!order_id || !status_code || !gross_amount || !signature_key) {
+            logError('Missing required fields in notification', {
+                order_id: !!order_id,
+                status_code: !!status_code,
+                gross_amount: !!gross_amount,
+                signature_key: !!signature_key
+            });
+            return res.status(400).json({ error: 'Missing required fields' });
+        }
+
         // Verify signature for security
-        if (!verifySignature(order_id, status_code, gross_amount, signature_key)) {
-            console.error('Invalid signature');
+        logInfo('Starting signature verification...');
+        const isValidSignature = verifySignature(order_id, status_code, gross_amount, signature_key);
+        
+        if (!isValidSignature) {
+            logError('Invalid signature detected', {
+                order_id,
+                status_code,
+                gross_amount,
+                received_signature: signature_key
+            });
             return res.status(400).json({ error: 'Invalid signature' });
         }
 
-        console.log(`Processing notification for order: ${order_id}, status: ${transaction_status}`);
+        logInfo('Signature verification passed');
+        logInfo(`Processing notification for order: ${order_id}, status: ${transaction_status}`);
 
         // Check if transaction is successful
         const isSuccessful = (
@@ -57,10 +152,18 @@ app.post('/payment-notification', async (req, res) => {
             transaction_status === 'settlement'
         );
 
+        logInfo('Transaction status analysis', {
+            transaction_status,
+            fraud_status,
+            isSuccessful
+        });
+
         if (isSuccessful) {
-            console.log('Payment successful, updating premium status...');
+            logInfo('Payment successful, starting database update process...');
             
             // Find the payment record using order_id (which should be the transaction_id in payments table)
+            logInfo(`Looking for payment record with transaction_id: ${order_id}`);
+            
             const { data: paymentData, error: paymentError } = await supabase
                 .from('payments')
                 .select('quiz_result_id, user_id')
@@ -68,22 +171,36 @@ app.post('/payment-notification', async (req, res) => {
                 .single();
 
             if (paymentError) {
-                console.error('Error finding payment:', paymentError);
+                logError('Error finding payment in database', {
+                    error: paymentError,
+                    transaction_id: order_id
+                });
                 return res.status(404).json({ error: 'Payment record not found' });
             }
 
+            logInfo('Payment record found', paymentData);
+
             // Update the quiz result to premium
+            logInfo(`Updating quiz result ${paymentData.quiz_result_id} to premium...`);
+            
             const { error: updateError } = await supabase
                 .from('quiz_results')
                 .update({ is_premium: true })
                 .eq('id', paymentData.quiz_result_id);
 
             if (updateError) {
-                console.error('Error updating quiz result:', updateError);
+                logError('Error updating quiz result to premium', {
+                    error: updateError,
+                    quiz_result_id: paymentData.quiz_result_id
+                });
                 return res.status(500).json({ error: 'Failed to update quiz result' });
             }
 
+            logInfo('Quiz result successfully updated to premium');
+
             // Update payment status to completed
+            logInfo('Updating payment status to completed...');
+            
             const { error: paymentUpdateError } = await supabase
                 .from('payments')
                 .update({ 
@@ -93,13 +210,18 @@ app.post('/payment-notification', async (req, res) => {
                 .eq('transaction_id', order_id);
 
             if (paymentUpdateError) {
-                console.error('Error updating payment status:', paymentUpdateError);
+                logError('Error updating payment status', {
+                    error: paymentUpdateError,
+                    transaction_id: order_id
+                });
+            } else {
+                logInfo('Payment status updated to completed');
             }
 
-            console.log(`Successfully updated quiz result ${paymentData.quiz_result_id} to premium`);
+            logInfo(`Successfully processed successful payment for quiz result ${paymentData.quiz_result_id}`);
             
         } else if (transaction_status === 'cancel' || transaction_status === 'deny' || transaction_status === 'expire') {
-            console.log('Payment failed/cancelled, updating payment status...');
+            logInfo('Payment failed/cancelled, updating payment status...');
             
             // Update payment status to failed
             const { error: paymentUpdateError } = await supabase
@@ -108,11 +230,16 @@ app.post('/payment-notification', async (req, res) => {
                 .eq('transaction_id', order_id);
 
             if (paymentUpdateError) {
-                console.error('Error updating payment status:', paymentUpdateError);
+                logError('Error updating payment status to failed', {
+                    error: paymentUpdateError,
+                    transaction_id: order_id
+                });
+            } else {
+                logInfo('Payment status updated to failed');
             }
             
         } else if (transaction_status === 'pending') {
-            console.log('Payment pending...');
+            logInfo('Payment pending, updating payment status...');
             
             // Update payment status to pending
             const { error: paymentUpdateError } = await supabase
@@ -121,15 +248,39 @@ app.post('/payment-notification', async (req, res) => {
                 .eq('transaction_id', order_id);
 
             if (paymentUpdateError) {
-                console.error('Error updating payment status:', paymentUpdateError);
+                logError('Error updating payment status to pending', {
+                    error: paymentUpdateError,
+                    transaction_id: order_id
+                });
+            } else {
+                logInfo('Payment status updated to pending');
             }
+        } else {
+            logWarning('Unhandled transaction status', {
+                transaction_status,
+                order_id
+            });
         }
 
+        const processingTime = Date.now() - startTime;
+        logInfo(`Notification processing completed in ${processingTime}ms`);
+        logInfo('=== PAYMENT NOTIFICATION PROCESSING COMPLETE ===');
+
         // Respond with 200 OK to acknowledge receipt
-        res.status(200).json({ message: 'Notification processed successfully' });
+        res.status(200).json({ 
+            message: 'Notification processed successfully',
+            order_id,
+            processing_time_ms: processingTime
+        });
         
     } catch (error) {
-        console.error('Error processing notification:', error);
+        const processingTime = Date.now() - startTime;
+        logError('Unexpected error processing notification', {
+            error: error.message,
+            stack: error.stack,
+            processing_time_ms: processingTime
+        });
+        logError('=== PAYMENT NOTIFICATION PROCESSING FAILED ===');
         res.status(500).json({ error: 'Internal server error' });
     }
 });
@@ -147,6 +298,7 @@ app.get('/health', (req, res) => {
 app.get('/payment-status/:orderId', async (req, res) => {
     try {
         const { orderId } = req.params;
+        logInfo(`Payment status request for order: ${orderId}`);
         
         const { data, error } = await supabase
             .from('payments')
@@ -159,21 +311,25 @@ app.get('/payment-status/:orderId', async (req, res) => {
             .single();
 
         if (error) {
+            logError('Payment status not found', { orderId, error });
             return res.status(404).json({ error: 'Payment not found' });
         }
 
+        logInfo('Payment status retrieved successfully', { orderId });
         res.json(data);
     } catch (error) {
-        console.error('Error fetching payment status:', error);
+        logError('Error fetching payment status', { error: error.message });
         res.status(500).json({ error: 'Internal server error' });
     }
 });
 
 // Start server
 app.listen(PORT, () => {
-    console.log(`Payment notification server running on port ${PORT}`);
-    console.log(`Notification endpoint: http://localhost:${PORT}/payment-notification`);
-    console.log(`Health check: http://localhost:${PORT}/health`);
+    console.log('='.repeat(50));
+    console.log(`✅ Payment notification server running on port ${PORT}`);
+    console.log(`📝 Notification endpoint: http://localhost:${PORT}/payment-notification`);
+    console.log(`❤️  Health check: http://localhost:${PORT}/health`);
+    console.log('='.repeat(50));
 });
 
 module.exports = app; 
